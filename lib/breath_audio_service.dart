@@ -38,34 +38,55 @@ class BreathAudioService {
       StreamController<double>.broadcast();
   Stream<double> get volumeStream => _volumeController.stream;
 
-  final Function(BreathRecorderState)? onStateChanged;
-  final Function(AudioTestResult)? onRecordingComplete;
+  final void Function(BreathRecorderState)? onStateChanged;
+  final void Function(AudioTestResult)? onRecordingComplete;
+
+  /// Called when a recording ends WITHOUT a valid result
+  /// (no breath detected, too short, etc.) so the UI can tell the user why.
+  final void Function(String reason)? onTestInvalid;
 
   Timer? _amplitudeTimer;
-  DateTime? _recordingStartTime;
   String? _currentFilePath;
 
   final List<double> _amplitudeSamples = [];
   double _baselineNoiseFloor = -50.0;
+  bool _isCalibrated = false;
 
-  // 🌬️ Robust Exhalation & Timeout State Variables
-  bool _hasBreathStarted = false;
-  int _silenceTickCount = 0;
-  int _recordingTickCounter = 0;
-  
-  // Configuration Constants
-  static const int _maxSilenceTicks = 14;       // ~0.7s of trailing silence to complete test
-  static const int _maxIdleStartupTicks = 100;  // 5 seconds (100 ticks * 50ms) before auto-canceling if no breath detected
-  static const double _strictBreathThreshold = 0.45; // High threshold to completely ignore background room noise/speech
+  // Recording state
+  DateTime? _recordingStartTime; // when recording began (for idle timeout)
+  DateTime? _breathStartTime;    // first loud tick
+  DateTime? _lastLoudTime;       // last tick still above the "sustained" level
+  bool _tickBusy = false;        // prevents overlapping async ticks
+  bool _finishing = false;       // prevents double stop/cancel
+
+  bool get hasBreathStarted => _breathStartTime != null;
+  bool get isCalibrated => _isCalibrated;
+
+  // Configuration
+  static const Duration _tickInterval = Duration(milliseconds: 50);
+  static const Duration _trailingSilence = Duration(milliseconds: 700);
+  static const Duration _idleStartupTimeout = Duration(seconds: 5);
+  static const Duration _minValidExhale = Duration(seconds: 1);
+  static const double _strictBreathThreshold = 0.45;
+  static const double _sustainThreshold = 0.45 * 0.4;
 
   BreathAudioService({
     this.onStateChanged,
     this.onRecordingComplete,
+    this.onTestInvalid,
   });
 
   Future<bool> hasPermission() async {
     return await _audioRecorder.hasPermission();
   }
+
+  /// Calibrates only once per app session (call [recalibrate] to force).
+  Future<void> ensureCalibrated() async {
+    if (_isCalibrated) return;
+    await startCalibration();
+  }
+
+  void recalibrate() => _isCalibrated = false;
 
   Future<void> startCalibration({
     Duration duration = const Duration(seconds: 2),
@@ -79,35 +100,49 @@ class BreathAudioService {
     _updateState(BreathRecorderState.calibrating);
 
     final tempDir = await getTemporaryDirectory();
-    final calibPath = p.join(tempDir.path, 'calib_${DateTime.now().millisecondsSinceEpoch}.m4a');
+    final calibPath =
+        p.join(tempDir.path, 'calib_${DateTime.now().millisecondsSinceEpoch}.m4a');
 
-    await _audioRecorder.start(
-      const RecordConfig(
-        encoder: AudioEncoder.aacLc,
-        bitRate: 128000,
-        sampleRate: 44100,
-      ),
-      path: calibPath,
-    );
+    final List<double> calibSamples = [];
+    Timer? calibTimer;
+    bool sampling = false;
 
-    List<double> calibSamples = [];
-    final calibTimer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
-      final amp = await _audioRecorder.getAmplitude();
-      calibSamples.add(amp.current);
-    });
+    try {
+      await _audioRecorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 44100,
+        ),
+        path: calibPath,
+      );
 
-    await Future.delayed(duration);
+      calibTimer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
+        if (sampling) return;
+        sampling = true;
+        try {
+          final amp = await _audioRecorder.getAmplitude();
+          // Ignore the "no data yet" floor values (-160 dB)
+          if (amp.current > -100) calibSamples.add(amp.current);
+        } catch (_) {} finally {
+          sampling = false;
+        }
+      });
 
-    calibTimer.cancel();
-    await _audioRecorder.stop();
-
-    final file = File(calibPath);
-    if (await file.exists()) {
-      await file.delete();
+      await Future.delayed(duration);
+    } finally {
+      calibTimer?.cancel();
+      try {
+        await _audioRecorder.stop();
+      } catch (_) {}
+      await _deleteFile(calibPath);
     }
 
     if (calibSamples.isNotEmpty) {
-      _baselineNoiseFloor = calibSamples.reduce((a, b) => a + b) / calibSamples.length;
+      final avg = calibSamples.reduce((a, b) => a + b) / calibSamples.length;
+      // Keep the floor in a sane range so a very quiet/very noisy room can't break normalization.
+      _baselineNoiseFloor = avg.clamp(-70.0, -25.0);
+      _isCalibrated = true;
     }
 
     _updateState(BreathRecorderState.idle);
@@ -128,11 +163,10 @@ class BreathAudioService {
 
     _amplitudeSamples.clear();
     _recordingStartTime = DateTime.now();
-    
-    // Reset state counters
-    _hasBreathStarted = false;
-    _silenceTickCount = 0;
-    _recordingTickCounter = 0;
+    _breathStartTime = null;
+    _lastLoudTime = null;
+    _tickBusy = false;
+    _finishing = false;
 
     await _audioRecorder.start(
       const RecordConfig(
@@ -145,64 +179,81 @@ class BreathAudioService {
 
     _updateState(BreathRecorderState.recording);
 
-    _amplitudeTimer = Timer.periodic(const Duration(milliseconds: 50), (_) async {
-      if (_state != BreathRecorderState.recording) return;
+    _amplitudeTimer = Timer.periodic(_tickInterval, (_) async {
+      if (_state != BreathRecorderState.recording || _tickBusy || _finishing) return;
+      _tickBusy = true;
 
-      _recordingTickCounter++;
-      final amp = await _audioRecorder.getAmplitude();
-      final normalized = _normalizeAmplitude(amp.current);
+      try {
+        final amp = await _audioRecorder.getAmplitude();
+        if (_state != BreathRecorderState.recording || _finishing) return;
 
-      _amplitudeSamples.add(normalized);
-      _volumeController.add(normalized);
+        final now = DateTime.now();
+        final normalized = _normalizeAmplitude(amp.current);
 
-      if (!_hasBreathStarted) {
-        // ⏳ 5-Second Startup Timeout Rule: If user doesn't blow within 5s, cancel completely
-        if (_recordingTickCounter >= _maxIdleStartupTicks) {
-          await cancelRecording();
-          return;
-        }
+        _amplitudeSamples.add(normalized);
+        if (!_volumeController.isClosed) _volumeController.add(normalized);
 
-        // 🔍 Check if the sound crosses the high threshold required for a direct breath blow
-        if (normalized >= _strictBreathThreshold) {
-          _hasBreathStarted = true;
-          _recordingStartTime = DateTime.now(); // Reset start time to exact moment the breath actually begins
-        }
-      } else {
-        // Breath has officially started; monitor for trailing silence to finish the test
-        if (normalized < (_strictBreathThreshold * 0.4)) {
-          _silenceTickCount++;
-          if (_silenceTickCount >= _maxSilenceTicks) {
-            await stopRecording();
+        if (_breathStartTime == null) {
+          // Wait for a real blow; give up after the idle timeout (wall-clock based).
+          if (normalized >= _strictBreathThreshold) {
+            _breathStartTime = now;
+            _lastLoudTime = now;
+          } else if (now.difference(_recordingStartTime!) >= _idleStartupTimeout) {
+            await _abort('No breath detected. Blow steadily toward the microphone and try again.');
           }
         } else {
-          // Reset silence counter if they continue blowing forcefully
-          _silenceTickCount = 0;
+          if (normalized >= _sustainThreshold) {
+            _lastLoudTime = now;
+          } else if (now.difference(_lastLoudTime!) >= _trailingSilence) {
+            await stopRecording();
+          }
         }
+      } catch (_) {
+        // Ignore a single failed amplitude read.
+      } finally {
+        _tickBusy = false;
       }
     });
   }
 
   Future<AudioTestResult?> stopRecording() async {
-    if (_state != BreathRecorderState.recording) return null;
+    if (_state != BreathRecorderState.recording || _finishing) return null;
+    _finishing = true;
 
     _amplitudeTimer?.cancel();
     _amplitudeTimer = null;
 
-    final path = await _audioRecorder.stop();
-    final endTime = DateTime.now();
+    String? path;
+    try {
+      path = await _audioRecorder.stop();
+    } catch (_) {}
 
-    final duration = _recordingStartTime != null
-        ? endTime.difference(_recordingStartTime!)
-        : Duration.zero;
+    final started = _breathStartTime;
+    final lastLoud = _lastLoudTime;
+    final samples = List<double>.from(_amplitudeSamples);
 
     _updateState(BreathRecorderState.idle);
+    _finishing = false;
 
-    if (path == null || _amplitudeSamples.isEmpty || !_hasBreathStarted) {
+    // Exhale length = first loud tick -> last loud tick (trailing silence is NOT counted).
+    final Duration duration = (started != null && lastLoud != null)
+        ? lastLoud.difference(started)
+        : Duration.zero;
+
+    if (path == null || samples.isEmpty || started == null) {
+      await _deleteFile(path ?? _currentFilePath);
+      onTestInvalid?.call('No breath detected. Please try again.');
       return null;
     }
 
-    final maxAmp = _amplitudeSamples.reduce((a, b) => a > b ? a : b);
-    final avgAmp = _amplitudeSamples.reduce((a, b) => a + b) / _amplitudeSamples.length;
+    if (duration < _minValidExhale) {
+      await _deleteFile(path);
+      onTestInvalid?.call('Exhale was too short to measure. Blow steadily for at least a second.');
+      return null;
+    }
+
+    final maxAmp = samples.reduce((a, b) => a > b ? a : b);
+    final avgAmp = samples.reduce((a, b) => a + b) / samples.length;
 
     final result = AudioTestResult(
       filePath: path,
@@ -211,34 +262,47 @@ class BreathAudioService {
       averageAmplitude: avgAmp,
     );
 
-    if (onRecordingComplete != null) {
-      onRecordingComplete!(result);
-    }
-
+    onRecordingComplete?.call(result);
     return result;
   }
 
-  Future<void> cancelRecording() async {
+  /// User-initiated discard (no message shown).
+  Future<void> cancelRecording() => _abort(null);
+
+  Future<void> _abort(String? reason) async {
+    if (_state != BreathRecorderState.recording || _finishing) return;
+    _finishing = true;
+
     _amplitudeTimer?.cancel();
     _amplitudeTimer = null;
 
-    if (await _audioRecorder.isRecording()) {
-      await _audioRecorder.stop();
-    }
-
-    if (_currentFilePath != null) {
-      final file = File(_currentFilePath!);
-      if (await file.exists()) {
-        await file.delete();
+    try {
+      if (await _audioRecorder.isRecording()) {
+        await _audioRecorder.stop();
       }
-    }
+    } catch (_) {}
 
+    await _deleteFile(_currentFilePath);
     _amplitudeSamples.clear();
+    _breathStartTime = null;
+    _lastLoudTime = null;
+
     _updateState(BreathRecorderState.idle);
+    _finishing = false;
+
+    if (reason != null) onTestInvalid?.call(reason);
+  }
+
+  Future<void> _deleteFile(String? path) async {
+    if (path == null) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
   }
 
   double _normalizeAmplitude(double db) {
-    if (db < _baselineNoiseFloor) return 0.0;
+    if (db.isNaN || db < _baselineNoiseFloor) return 0.0;
     if (db >= 0.0) return 1.0;
 
     final range = 0.0 - _baselineNoiseFloor;
@@ -249,14 +313,19 @@ class BreathAudioService {
 
   void _updateState(BreathRecorderState newState) {
     _state = newState;
-    _stateController.add(_state);
-    if (onStateChanged != null) {
-      onStateChanged!(_state);
-    }
+    if (!_stateController.isClosed) _stateController.add(_state);
+    onStateChanged?.call(_state);
   }
 
   Future<void> dispose() async {
     _amplitudeTimer?.cancel();
+    _amplitudeTimer = null;
+    try {
+      if (await _audioRecorder.isRecording()) {
+        await _audioRecorder.stop();
+      }
+    } catch (_) {}
+    await _deleteFile(_currentFilePath);
     await _audioRecorder.dispose();
     await _stateController.close();
     await _volumeController.close();
