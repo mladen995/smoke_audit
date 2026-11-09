@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+   	<key>NSLocationWhenInUseUsageDescription</key>
+   	<string>Optional: saves where a craving happened, only on this phone, only if you turn it on in Settings.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Airflow Engine requires Face ID to securely authenticate and unlock your local encrypted metrics data profiles.</string>
 	<key>NSMicrophoneUsageDescription</key>

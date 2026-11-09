@@ -1,14 +1,16 @@
 // lib/repositories/app_repository.dart
 //
 // The ONLY place that knows how data is stored. Today: SharedPreferences.
-// Later (multiple profiles / lots of logs): swap the internals for Drift/SQLite
-// without touching any screen.
+// Later (lots of logs / encryption): swap the internals without touching screens.
 import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/app_settings.dart';
 import '../models/breath_log.dart';
 import '../models/user_profile.dart';
+import '../utils/time_codec.dart';
 
 class AppRepository {
   static const int schemaVersion = 2;
@@ -17,6 +19,7 @@ class AppRepository {
   static const String _kSchema = 'schema_version';
   static const String _kProfiles = 'profiles_v2';
   static const String _kActiveProfile = 'active_profile_id';
+  static const String _kSettings = 'app_settings_v1';
   static String _logsKey(String pid) => 'logs_v2_$pid';
   static String _shieldKey(String pid) => 'shield_exp_v2_$pid';
   static String _cooldownKey(String pid) => 'shield_cd_v2_$pid';
@@ -85,6 +88,25 @@ class AppRepository {
     await prefs.remove(_legacyLogs);
     await prefs.remove(_legacyShield);
     await prefs.remove(_legacyCooldown);
+  }
+
+  // ───────────────────────── Settings ─────────────────────────
+
+  Future<AppSettings> loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? raw = prefs.getString(_kSettings);
+    if (raw == null) return const AppSettings();
+    try {
+      return AppSettings.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (e) {
+      debugPrint('AppRepository: unreadable settings, using defaults: $e');
+      return const AppSettings();
+    }
+  }
+
+  Future<void> saveSettings(AppSettings settings) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kSettings, jsonEncode(settings.toJson()));
   }
 
   // ───────────────────────── Profiles ─────────────────────────
@@ -160,17 +182,32 @@ class AppRepository {
     return logs.map((l) => l.timestamp).reduce((a, b) => a.isBefore(b) ? a : b);
   }
 
+  /// Removes coordinates from every stored entry. Returns how many entries had one.
+  Future<int> deleteAllLocations() async {
+    final profiles = await loadProfiles();
+    final Set<String> ids = {legacyProfileId, ...profiles.map((p) => p.id)};
+    int cleared = 0;
+    for (final id in ids) {
+      final logs = await loadLogs(id);
+      final int withLocation = logs.where((l) => l.hasLocation).length;
+      if (withLocation > 0) {
+        cleared += withLocation;
+        await saveLogs(id, logs.map((l) => l.withoutLocation()).toList());
+      }
+    }
+    return cleared;
+  }
+
   // ───────────────────────── Airway Shield ─────────────────────────
 
   Future<void> saveShieldExpiration(String profileId, DateTime t) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_shieldKey(profileId), t.toIso8601String());
+    await prefs.setString(_shieldKey(profileId), TimeCodec.encode(t));
   }
 
   Future<DateTime?> loadShieldExpiration(String profileId) async {
     final prefs = await SharedPreferences.getInstance();
-    final s = prefs.getString(_shieldKey(profileId));
-    return s == null ? null : DateTime.tryParse(s);
+    return TimeCodec.tryDecode(prefs.getString(_shieldKey(profileId)));
   }
 
   Future<void> clearShieldExpiration(String profileId) async {
@@ -180,13 +217,12 @@ class AppRepository {
 
   Future<void> saveShieldCooldown(String profileId, DateTime t) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_cooldownKey(profileId), t.toIso8601String());
+    await prefs.setString(_cooldownKey(profileId), TimeCodec.encode(t));
   }
 
   Future<DateTime?> loadShieldCooldown(String profileId) async {
     final prefs = await SharedPreferences.getInstance();
-    final s = prefs.getString(_cooldownKey(profileId));
-    return s == null ? null : DateTime.tryParse(s);
+    return TimeCodec.tryDecode(prefs.getString(_cooldownKey(profileId)));
   }
 
   Future<void> clearShieldCooldown(String profileId) async {
@@ -202,5 +238,32 @@ class AppRepository {
     await prefs.remove(_logsKey(profileId));
     await prefs.remove(_shieldKey(profileId));
     await prefs.remove(_cooldownKey(profileId));
+  }
+
+  /// Replaces ALL profiles and logs (used by backup restore). Settings are left alone.
+  Future<void> replaceAllData({
+    required List<UserProfile> profiles,
+    required Map<String, List<BreathLog>> logsByProfile,
+    String? activeProfileId,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+
+    final existing = await loadProfiles();
+    for (final p in existing) {
+      await resetProfileData(p.id);
+    }
+
+    await prefs.setStringList(_kProfiles, profiles.map((p) => jsonEncode(p.toJson())).toList());
+    for (final p in profiles) {
+      await saveLogs(p.id, logsByProfile[p.id] ?? const <BreathLog>[]);
+    }
+
+    final bool activeExists = activeProfileId != null && profiles.any((p) => p.id == activeProfileId);
+    final String? active = activeExists ? activeProfileId : (profiles.isEmpty ? null : profiles.first.id);
+    if (active != null) {
+      await prefs.setString(_kActiveProfile, active);
+    } else {
+      await prefs.remove(_kActiveProfile);
+    }
   }
 }

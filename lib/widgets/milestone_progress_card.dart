@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/medical_milestone_model.dart';
+import '../utils/formatters.dart';
 
 class MilestoneProgressCard extends StatefulWidget {
   final DateTime quitTimestamp;
@@ -50,7 +51,7 @@ class _MilestoneProgressCardState extends State<MilestoneProgressCard> {
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.04),
+            color: Colors.black.withValues(alpha: 0.04),
             blurRadius: 10,
             offset: const Offset(0, 3),
           )
@@ -152,7 +153,7 @@ class _MilestoneProgressCardState extends State<MilestoneProgressCard> {
                     ),
                     const SizedBox(width: 8),
                     Text(
-                      "Target: ${_formatDate(targetDate)}",
+                      "Target: ${Fmt.date(context, targetDate)}",
                       style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.teal.shade900),
                     ),
                   ],
@@ -233,10 +234,6 @@ class _MilestoneProgressCardState extends State<MilestoneProgressCard> {
         ],
       ),
     );
-  }
-
-  String _formatDate(DateTime date) {
-    return "${date.month}/${date.day}/${date.year}";
   }
 
   String _formatDuration(Duration d) {

@@ -5,14 +5,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 
+import 'app_controller.dart';
 import 'breath_audio_service.dart';
+import 'logic/tracker_logic.dart';
+import 'models/app_settings.dart';
 import 'models/breath_log.dart';
 import 'models/user_profile.dart';
 import 'onboarding_screen.dart';
 import 'repositories/app_repository.dart';
+import 'services/reminder_service.dart';
+import 'settings_screen.dart';
+import 'utils/formatters.dart';
+import 'widgets/export_sheet.dart';
 import 'widgets/milestone_progress_card.dart';
 
 class _SessionResult {
@@ -23,9 +28,23 @@ class _SessionResult {
 
 class BreathTestScreen extends StatefulWidget {
   final AppRepository repo;
+  final AppController controller;
   final UserProfile profile;
 
-  const BreathTestScreen({super.key, required this.repo, required this.profile});
+  /// Called when the profile is edited or reset, so the app root keeps the same copy.
+  final void Function(UserProfile profile) onProfileChanged;
+
+  /// Called after a backup restore replaced the stored data; the root reloads everything.
+  final Future<void> Function() onDataReplaced;
+
+  const BreathTestScreen({
+    super.key,
+    required this.repo,
+    required this.controller,
+    required this.profile,
+    required this.onProfileChanged,
+    required this.onDataReplaced,
+  });
 
   @override
   State<BreathTestScreen> createState() => _BreathTestScreenState();
@@ -54,8 +73,6 @@ class _BreathTestScreenState extends State<BreathTestScreen>
   bool _isStartingTest = false;
 
   // Guided personal-baseline session
-  static const int _baselineTestsRequired = 3;
-  static const int _scoreWindowDays = 30;
   bool _baselineSessionActive = false;
   final List<_SessionResult> _sessionResults = [];
 
@@ -132,6 +149,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
   // ───────────────────────── Profile ─────────────────────────
 
   Future<void> _editProfile() async {
+    if (!mounted) return;
     final UserProfile? updated = await Navigator.of(context).push<UserProfile>(
       MaterialPageRoute(
         builder: (ctx) => OnboardingScreen(
@@ -166,6 +184,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
     await widget.repo.saveProfile(updated);
     if (!mounted) return;
     setState(() => _profile = updated);
+    widget.onProfileChanged(updated);
+    _syncReminders();
     _showSnack("Profile updated.", color: Colors.blueGrey);
   }
 
@@ -279,6 +299,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
   }
 
   void _showResetConfirmationDialog() {
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (BuildContext dialogContext) {
@@ -305,6 +326,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
                     _baselineSessionActive = false;
                     _sessionResults.clear();
                   });
+                  widget.onProfileChanged(updated);
+                  _syncReminders();
                 }
                 if (dialogContext.mounted) Navigator.pop(dialogContext);
               },
@@ -431,10 +454,10 @@ class _BreathTestScreenState extends State<BreathTestScreen>
       _sessionResults.add(_SessionResult(result.duration, DateTime.now()));
     });
 
-    if (_sessionResults.length < _baselineTestsRequired) {
+    if (_sessionResults.length < TrackerLogic.baselineTestsRequired) {
       final secs = (result.duration.inMilliseconds / 1000).toStringAsFixed(1);
       _showSnack(
-        "Test ${_sessionResults.length} of $_baselineTestsRequired saved ($secs s). Rest about 30 seconds, then continue.",
+        "Test ${_sessionResults.length} of ${TrackerLogic.baselineTestsRequired} saved ($secs s). Rest about 30 seconds, then continue.",
         color: Colors.teal,
       );
       return;
@@ -445,9 +468,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
   Future<void> _finishBaselineSession() async {
     final List<double> secs =
         _sessionResults.map((r) => r.duration.inMilliseconds / 1000.0).toList();
-    final double med = _median(secs)!;
-    final double spread = (secs.reduce(max) - secs.reduce(min)) / (med <= 0 ? 1 : med);
-    final bool inconsistent = spread > 0.4;
+    final double med = TrackerLogic.median(secs)!;
+    final bool inconsistent = TrackerLogic.isInconsistent(secs);
 
     final bool? keep = await showDialog<bool>(
       context: context,
@@ -571,6 +593,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
         ..addAll(savedLogs);
       _sortLogsChronologically();
     });
+    _syncReminders();
   }
 
   void _sortLogsChronologically() {
@@ -579,6 +602,44 @@ class _BreathTestScreenState extends State<BreathTestScreen>
 
   Future<void> _commitStateToDisk() async {
     await widget.repo.saveLogs(_pid, _historicalLogs);
+    _syncReminders();
+  }
+
+  /// Keeps scheduled notifications in line with settings and the current streak.
+  Future<void> _syncReminders() async {
+    final AppSettings st = widget.controller.settings;
+    final DateTime? streakStart = (st.milestoneAlertsEnabled && !_profile.quitDate.isAfter(DateTime.now()))
+        ? TrackerLogic.streakAnchor(_profile.quitDate, _historicalLogs)
+        : null;
+    await ReminderService.instance.sync(st, streakStart);
+  }
+
+  /// Called by Settings after anything changed (settings, restore, deleted locations).
+  Future<void> _onSettingsDataChanged() async {
+    await _loadPersistedDatabase();
+    await _syncReminders();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => SettingsScreen(
+          controller: widget.controller,
+          repo: widget.repo,
+          onDataChanged: () async {
+            await _onSettingsDataChanged();
+            // A restore may have replaced the profile itself.
+            final UserProfile? stored = await widget.repo.loadActiveProfile();
+            if (stored != null && mounted && stored.toJson().toString() != _profile.toJson().toString()) {
+              await widget.onDataReplaced();
+            }
+          },
+          onEditProfile: _editProfile,
+          onResetProfile: _showResetConfirmationDialog,
+        ),
+      ),
+    );
   }
 
   void _handleStateTransitions(BreathRecorderState newState) {
@@ -595,87 +656,24 @@ class _BreathTestScreenState extends State<BreathTestScreen>
   }
 
   // ───────────────────────── Metrics ─────────────────────────
+  // The maths lives in logic/tracker_logic.dart (unit-tested); these are thin wrappers.
 
-  double? _median(List<double> values) {
-    if (values.isEmpty) return null;
-    final sorted = List<double>.from(values)..sort();
-    final int mid = sorted.length ~/ 2;
-    return sorted.length.isOdd ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0;
-  }
+  double? get _baselineSeconds => TrackerLogic.baselineSeconds(_historicalLogs);
 
-  /// Personal baseline = median of the 3 most recent guided baseline-session tests.
-  double? get _baselineSeconds {
-    final session = _historicalLogs
-        .where((l) => l.kind == LogKind.baselineSession && l.duration.inMilliseconds > 0)
-        .take(_baselineTestsRequired)
-        .map((l) => l.duration.inMilliseconds / 1000.0)
-        .toList();
-    return _median(session);
-  }
+  double? _currentSeconds(Set<TestContext> contexts) =>
+      TrackerLogic.currentSeconds(_historicalLogs, contexts, DateTime.now());
 
-  /// Median of the latest (up to 3) tests in [contexts] within the scoring window.
-  double? _currentSeconds(Set<TestContext> contexts) {
-    final cutoff = DateTime.now().subtract(const Duration(days: _scoreWindowDays));
-    final recent = _historicalLogs
-        .where((l) =>
-            contexts.contains(l.context) && l.duration.inMilliseconds > 0 && l.timestamp.isAfter(cutoff))
-        .take(3)
-        .map((l) => l.duration.inMilliseconds / 1000.0)
-        .toList();
-    return _median(recent);
-  }
-
-  /// 100 = your own baseline. Above 100 = better than baseline.
-  int? _scoreFor(double? seconds) {
-    final base = _baselineSeconds;
-    if (seconds == null || base == null || base <= 0) return null;
-    return (seconds / base * 100).round();
-  }
+  int? _scoreFor(double? seconds) => TrackerLogic.scoreFor(seconds, _baselineSeconds);
 
   String _deltaText(int score) {
     final int d = score - 100;
     return "${d > 0 ? '+' : ''}$d% vs baseline";
   }
 
-  bool _isRelapseContext(TestContext c) => c == TestContext.relapseSlip || c == TestContext.afterSmoking;
+  Duration _getTimeSinceLastExposure() =>
+      TrackerLogic.streakElapsed(_profile.quitDate, _historicalLogs, DateTime.now());
 
-  /// Streak = time since the later of (quit date, last slip-up / after-smoking test).
-  /// A planned (future) quit date shows 0 until it arrives.
-  Duration _getTimeSinceLastExposure() {
-    final now = DateTime.now();
-    DateTime anchor = _profile.quitDate;
-
-    for (final log in _historicalLogs) {
-      if (_isRelapseContext(log.context) && log.timestamp.isAfter(anchor)) {
-        anchor = log.timestamp;
-      }
-    }
-
-    final d = now.difference(anchor);
-    return d.isNegative ? Duration.zero : d;
-  }
-
-  Duration _longestStreak() {
-    final now = DateTime.now();
-    final quit = _profile.quitDate;
-    if (quit.isAfter(now)) return Duration.zero;
-
-    final List<DateTime> points = [
-      quit,
-      ..._historicalLogs
-          .where((l) => _isRelapseContext(l.context) && l.timestamp.isAfter(quit))
-          .map((l) => l.timestamp),
-    ];
-    points.sort();
-    points.add(now);
-
-    Duration best = Duration.zero;
-    for (int i = 1; i < points.length; i++) {
-      final d = points[i].difference(points[i - 1]);
-      if (d > best) best = d;
-    }
-    return best;
-  }
+  Duration _longestStreak() => TrackerLogic.longestStreak(_profile.quitDate, _historicalLogs, DateTime.now());
 
   String _fmtStreak(Duration d) {
     if (d.inDays >= 1) return "${d.inDays}d ${d.inHours % 24}h";
@@ -683,24 +681,15 @@ class _BreathTestScreenState extends State<BreathTestScreen>
     return "${d.inMinutes}m";
   }
 
-  String _timeBucket(int hour) {
-    if (hour >= 5 && hour < 11) return "morning";
-    if (hour >= 11 && hour < 15) return "midday";
-    if (hour >= 15 && hour < 19) return "afternoon";
-    if (hour >= 19) return "evening";
-    return "late night";
-  }
-
   Widget? _buildSavingsLine(Duration elapsed) {
     final int? cpd = _profile.cigarettesPerDay;
     if (cpd == null) return null;
 
-    final double days = elapsed.inSeconds / 86400.0;
-    final int avoided = (days * cpd).floor();
+    final int avoided = TrackerLogic.cigarettesAvoided(elapsed, cpd);
     String text = "≈ $avoided cigarettes not smoked";
     final double? price = _profile.pricePerPack;
     if (price != null) {
-      text += "  ·  ≈ \$${(avoided / 20.0 * price).toStringAsFixed(2)} saved";
+      text += "  ·  ≈ ${Fmt.money(context, TrackerLogic.moneySaved(avoided, price))} saved";
     }
     return Padding(
       padding: const EdgeInsets.only(top: 4, bottom: 4),
@@ -710,147 +699,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
 
   // ───────────────────────── Export ─────────────────────────
 
-  Future<void> _exportBiometricDataSecurely({DateTime? startDate, DateTime? endDate}) async {
-    final StringBuffer csvBuffer = StringBuffer();
-    csvBuffer.writeln("Timestamp_ISO8601_UTC,Medical_Context,Exhale_Duration_Sec,Latitude,Longitude,Data_Ingestion_Type");
-
-    final chronologicalLogs = _historicalLogs.reversed.where((log) {
-      final DateTime logTime = log.timestamp;
-      if (startDate != null && logTime.isBefore(startDate)) return false;
-      if (endDate != null && logTime.isAfter(endDate.add(const Duration(hours: 23, minutes: 59, seconds: 59)))) {
-        return false;
-      }
-      return true;
-    }).toList();
-
-    if (chronologicalLogs.isEmpty) {
-      _showSnack("No records found within the selected date range.", color: Colors.orange);
-      return;
-    }
-
-    for (var log in chronologicalLogs) {
-      final double durationSec = log.duration.inMilliseconds / 1000.0;
-
-      String contextStr = "BaselineCapacity";
-      switch (log.context) {
-        case TestContext.standardBaseline:
-          contextStr = "BaselineCapacity";
-          break;
-        case TestContext.postExposure:
-          contextStr = "PostExposure";
-          break;
-        case TestContext.relapseSlip:
-          contextStr = "RelapseSlip";
-          break;
-        case TestContext.cravingThreat:
-          contextStr = "CravingDeflectedThreat";
-          break;
-        case TestContext.afterSmoking:
-          contextStr = "AfterSmoking";
-          break;
-      }
-
-      final String latStr = log.latitude != null ? log.latitude!.toStringAsFixed(4) : "";
-      final String lngStr = log.longitude != null ? log.longitude!.toStringAsFixed(4) : "";
-      final String statusStr = log.kind == LogKind.baselineSession
-          ? "BaselineSession"
-          : (log.isManual ? "ManualInput" : "AcousticSignalProcessing");
-
-      csvBuffer.writeln("${log.timestamp.toUtc().toIso8601String()},$contextStr,$durationSec,$latStr,$lngStr,$statusStr");
-    }
-
-    try {
-      final Directory tempDir = await getTemporaryDirectory();
-      final File csvFile = File('${tempDir.path}/AirEngine_Pulmonary_Export.csv');
-      await csvFile.writeAsString(csvBuffer.toString());
-
-      final XFile xFile = XFile(csvFile.path);
-      final RenderBox? box = mounted ? context.findRenderObject() as RenderBox? : null;
-      final Rect? sharePositionOrigin = box != null ? box.localToGlobal(Offset.zero) & box.size : null;
-
-      await Share.shareXFiles(
-        [xFile],
-        subject: 'AirEngine Biometric Telemetry Report',
-        sharePositionOrigin: sharePositionOrigin,
-      );
-
-      await Future.delayed(const Duration(seconds: 2));
-      if (await csvFile.exists()) {
-        await csvFile.delete();
-      }
-    } catch (e) {
-      _showSnack("Export operation error: $e");
-    }
-  }
-
-  void _showExportFilterBottomSheet() {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (BuildContext sheetContext) {
-        final now = DateTime.now();
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 20.0, horizontal: 16.0),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("Export Telemetry Report",
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87)),
-                const SizedBox(height: 4),
-                Text("Select chronological parameters for CSV data payload generation.",
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600)),
-                const SizedBox(height: 16),
-                ListTile(
-                  leading: const Icon(Icons.date_range_rounded, color: Colors.teal),
-                  title: const Text("Past 30 Days", style: TextStyle(fontSize: 14)),
-                  onTap: () {
-                    Navigator.pop(sheetContext);
-                    _exportBiometricDataSecurely(startDate: now.subtract(const Duration(days: 30)));
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.calendar_today_rounded, color: Colors.teal),
-                  title: const Text("Year to Date (Whole Year)", style: TextStyle(fontSize: 14)),
-                  onTap: () {
-                    Navigator.pop(sheetContext);
-                    _exportBiometricDataSecurely(startDate: DateTime(now.year, 1, 1));
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.all_inclusive_rounded, color: Colors.teal),
-                  title: const Text("All-Time Historical Ledger", style: TextStyle(fontSize: 14)),
-                  onTap: () {
-                    Navigator.pop(sheetContext);
-                    _exportBiometricDataSecurely();
-                  },
-                ),
-                const Divider(),
-                ListTile(
-                  leading: const Icon(Icons.tune_rounded, color: Colors.orange),
-                  title: const Text("Custom Date Range...",
-                      style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                  onTap: () async {
-                    Navigator.pop(sheetContext);
-                    if (!mounted) return;
-                    final DateTimeRange? pickedRange = await showDateRangePicker(
-                      context: context,
-                      firstDate: DateTime.now().subtract(const Duration(days: 365 * 5)),
-                      lastDate: DateTime.now(),
-                      saveText: "EXPORT",
-                    );
-                    if (pickedRange != null) {
-                      _exportBiometricDataSecurely(startDate: pickedRange.start, endDate: pickedRange.end);
-                    }
-                  },
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
+  void _openExport() {
+    showExportSheet(context, profile: _profile, logs: List<BreathLog>.of(_historicalLogs));
   }
 
   // ───────────────────────── Airway Shield ─────────────────────────
@@ -880,6 +730,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
       double? lng;
 
       try {
+        // Location is only read when the user turned it on in Settings.
+        if (!widget.controller.settings.saveCravingLocation) throw StateError('location off');
         LocationPermission permission = await Geolocator.checkPermission();
         if (permission == LocationPermission.denied) {
           permission = await Geolocator.requestPermission();
@@ -1005,7 +857,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
     if (baseline == null) {
       breathSubtitle = "set your baseline";
     } else if (breathScore == null) {
-      breathSubtitle = "no tests in $_scoreWindowDays days";
+      breathSubtitle = "no tests in ${TrackerLogic.scoreWindowDays} days";
     } else {
       breathSubtitle = _deltaText(breathScore);
     }
@@ -1031,14 +883,13 @@ class _BreathTestScreenState extends State<BreathTestScreen>
               )
             : null,
         actions: [
-          IconButton(icon: const Icon(Icons.person_rounded), tooltip: "Edit profile", onPressed: _editProfile),
-          IconButton(icon: const Icon(Icons.share), tooltip: "Secure Data Export", onPressed: _showExportFilterBottomSheet),
+          IconButton(icon: const Icon(Icons.ios_share_rounded), tooltip: "Share with clinician", onPressed: _openExport),
           IconButton(
             icon: const Icon(Icons.edit_calendar),
             tooltip: "Log Forgotten Smoke",
             onPressed: _handleBackdatedExposureLogging,
           ),
-          IconButton(icon: const Icon(Icons.refresh), tooltip: "Reset data", onPressed: _showResetConfirmationDialog)
+          IconButton(icon: const Icon(Icons.settings_rounded), tooltip: "Settings", onPressed: _openSettings),
         ],
       ),
       body: SafeArea(
@@ -1076,7 +927,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
                                   ElevatedButton.icon(
                                     onPressed: _startCravingDelay,
                                     icon: const Icon(Icons.security),
-                                    label: const Text("Activate Airway Shield (Log GPS Trigger)"),
+                                    label: const Text("Activate Airway Shield"),
                                   ),
                               ],
                             ),
@@ -1196,11 +1047,11 @@ class _BreathTestScreenState extends State<BreathTestScreen>
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text("PERSONAL BASELINE · $done of $_baselineTestsRequired done",
+            Text("PERSONAL BASELINE · $done of ${TrackerLogic.baselineTestsRequired} done",
                 style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.teal.shade800)),
             const SizedBox(height: 8),
             LinearProgressIndicator(
-              value: done / _baselineTestsRequired,
+              value: done / TrackerLogic.baselineTestsRequired,
               minHeight: 6,
               backgroundColor: Colors.white,
               color: Colors.teal.shade600,
@@ -1257,29 +1108,13 @@ class _BreathTestScreenState extends State<BreathTestScreen>
   }
 
   Widget _buildInsightsCard() {
-    final int beaten = max(
-      0,
-      _historicalLogs.where((l) => l.kind == LogKind.cravingMarker).length - (_isCravingModeActive ? 1 : 0),
-    );
-    final int slips = _historicalLogs.where((l) => l.kind == LogKind.userSlip).length;
+    final int beaten = TrackerLogic.urgesBeaten(_historicalLogs, shieldActive: _isCravingModeActive);
+    final int slips = TrackerLogic.slipUps(_historicalLogs);
     final Duration longest = _longestStreak();
 
-    final urgeTimes = _historicalLogs
-        .where((l) => l.kind == LogKind.cravingMarker || l.kind == LogKind.userSlip)
-        .map((l) => l.timestamp)
-        .toList();
-
-    String? peakText;
-    if (urgeTimes.length >= 5) {
-      final Map<String, int> counts = {};
-      for (final t in urgeTimes) {
-        counts.update(_timeBucket(t.hour), (v) => v + 1, ifAbsent: () => 1);
-      }
-      final top = counts.entries.reduce((a, b) => a.value >= b.value ? a : b);
-      if (top.value / urgeTimes.length >= 0.4) {
-        peakText = "Most of your urges hit in the ${top.key} (${top.value} of ${urgeTimes.length}).";
-      }
-    }
+    final PeakUrge? peak = TrackerLogic.peakUrge(_historicalLogs);
+    final String? peakText =
+        peak == null ? null : "Most of your urges hit in the ${peak.bucket} (${peak.count} of ${peak.total}).";
 
     Widget stat(String label, String value) {
       return Expanded(
@@ -1371,7 +1206,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
         height: 140,
         margin: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: Colors.teal.shade50.withOpacity(0.3),
+          color: Colors.teal.shade50.withValues(alpha: 0.3),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: Colors.teal.shade100),
         ),
@@ -1480,7 +1315,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
         borderRadius: BorderRadius.circular(16),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.04),
+            color: Colors.black.withValues(alpha: 0.04),
             blurRadius: 10,
             offset: const Offset(0, 3),
           )
@@ -1575,9 +1410,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
                         if (index < 0 || index >= chartDataPoints.length) return const SizedBox.shrink();
                         final DateTime dt = chartDataPoints[index]['timestamp'] as DateTime;
 
-                        final String labelText = totalSpanDays > 180
-                            ? "${dt.month}/${dt.year.toString().substring(2)}"
-                            : "${dt.month}/${dt.day}";
+                        final String labelText =
+                            totalSpanDays > 180 ? Fmt.monthYear(context, dt) : Fmt.monthDay(context, dt);
 
                         return Padding(
                           padding: const EdgeInsets.only(top: 6.0),
@@ -1614,8 +1448,8 @@ class _BreathTestScreenState extends State<BreathTestScreen>
                       show: true,
                       gradient: LinearGradient(
                         colors: [
-                          Colors.teal.shade300.withOpacity(0.3),
-                          Colors.teal.shade50.withOpacity(0.0),
+                          Colors.teal.shade300.withValues(alpha: 0.3),
+                          Colors.teal.shade50.withValues(alpha: 0.0),
                         ],
                         begin: Alignment.topCenter,
                         end: Alignment.bottomCenter,
@@ -1704,9 +1538,9 @@ class _BreathTestScreenState extends State<BreathTestScreen>
               child: Icon(icon, color: iconColor, size: 20),
             ),
             title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
-            subtitle: Text("${dt.month}/${dt.day}/${dt.year} @ ${dt.hour}:${dt.minute.toString().padLeft(2, '0')}"),
+            subtitle: Text(Fmt.dateTime(context, dt)),
             trailing: dur > 0
-                ? Text("${dur.toStringAsFixed(1)}s", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15))
+                ? Text("${Fmt.seconds(context, dur)}s", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15))
                 : null,
           ),
         );
@@ -1732,7 +1566,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
     }
 
     final String idleLabel = _baselineSessionActive
-        ? "Baseline Test ${min(_sessionResults.length + 1, _baselineTestsRequired)} of $_baselineTestsRequired"
+        ? "Baseline Test ${min(_sessionResults.length + 1, TrackerLogic.baselineTestsRequired)} of ${TrackerLogic.baselineTestsRequired}"
         : "Begin Exhale Capacity Test";
 
     return Container(
@@ -1741,7 +1575,7 @@ class _BreathTestScreenState extends State<BreathTestScreen>
         color: Colors.white,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.05),
+            color: Colors.black.withValues(alpha: 0.05),
             blurRadius: 10,
             offset: const Offset(0, -2),
           ),

@@ -1,6 +1,8 @@
 // lib/models/breath_log.dart
 import 'dart:math';
 
+import '../utils/time_codec.dart';
+
 /// ORDER MATTERS for migrating v1 data (v1 stored the enum index).
 enum TestContext {
   standardBaseline,
@@ -79,12 +81,36 @@ class BreathLog {
   static String newId() =>
       '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(1 << 20)}';
 
+  bool get hasLocation => latitude != null || longitude != null;
+
+  BreathLog withoutLocation() => BreathLog(
+        id: id,
+        profileId: profileId,
+        kind: kind,
+        context: context,
+        timestamp: timestamp,
+        duration: duration,
+        isManual: isManual,
+      );
+
+  BreathLog withProfileId(String newProfileId) => BreathLog(
+        id: id,
+        profileId: newProfileId,
+        kind: kind,
+        context: context,
+        timestamp: timestamp,
+        duration: duration,
+        isManual: isManual,
+        latitude: latitude,
+        longitude: longitude,
+      );
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'profileId': profileId,
         'kind': kind,
         'context': context.name,
-        'timestamp': timestamp.toIso8601String(),
+        'timestamp': TimeCodec.encode(timestamp),
         'durationMs': duration.inMilliseconds,
         'isManual': isManual,
         'latitude': latitude,
@@ -100,7 +126,7 @@ class BreathLog {
         (e) => e.name == json['context'],
         orElse: () => TestContext.standardBaseline,
       ),
-      timestamp: DateTime.parse(json['timestamp'] as String),
+      timestamp: TimeCodec.decode(json['timestamp'] as String),
       duration: Duration(milliseconds: (json['durationMs'] as num?)?.toInt() ?? 0),
       isManual: (json['isManual'] as bool?) ?? false,
       latitude: (json['latitude'] as num?)?.toDouble(),

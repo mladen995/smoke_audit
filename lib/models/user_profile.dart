@@ -1,4 +1,5 @@
 // lib/models/user_profile.dart
+import '../utils/time_codec.dart';
 
 enum BiologicalSex { male, female, unspecified }
 
@@ -16,6 +17,8 @@ class UserProfile {
 
   final String id;
   final String displayName;
+
+  /// A calendar date (no time zone meaning).
   final DateTime dateOfBirth;
   final BiologicalSex sex;
 
@@ -24,6 +27,8 @@ class UserProfile {
   final bool useImperial;
 
   final SmokingStatus smokingStatus;
+
+  /// An instant in time (stored as UTC).
   final DateTime quitDate;
 
   // Optional smoking history
@@ -90,11 +95,11 @@ class UserProfile {
         'heightCm': heightCm,
         'useImperial': useImperial,
         'smokingStatus': smokingStatus.name,
-        'quitDate': quitDate.toIso8601String(),
+        'quitDate': TimeCodec.encode(quitDate),
         'cigarettesPerDay': cigarettesPerDay,
         'yearsSmoked': yearsSmoked,
         'pricePerPack': pricePerPack,
-        'createdAt': createdAt.toIso8601String(),
+        'createdAt': TimeCodec.encode(createdAt),
       };
 
   factory UserProfile.fromJson(Map<String, dynamic> json) {
@@ -112,11 +117,11 @@ class UserProfile {
         (e) => e.name == json['smokingStatus'],
         orElse: () => SmokingStatus.quit,
       ),
-      quitDate: DateTime.parse(json['quitDate'] as String),
+      quitDate: TimeCodec.decode(json['quitDate'] as String),
       cigarettesPerDay: (json['cigarettesPerDay'] as num?)?.toInt(),
       yearsSmoked: (json['yearsSmoked'] as num?)?.toInt(),
       pricePerPack: (json['pricePerPack'] as num?)?.toDouble(),
-      createdAt: DateTime.tryParse((json['createdAt'] as String?) ?? '') ?? DateTime.now(),
+      createdAt: TimeCodec.tryDecode(json['createdAt'] as String?) ?? DateTime.now(),
     );
   }
 }

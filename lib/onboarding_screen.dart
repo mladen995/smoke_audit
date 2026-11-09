@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 
 import 'models/user_profile.dart';
+import 'utils/formatters.dart';
 
 /// First-run setup AND "Edit profile" (when [initialProfile] is provided).
 class OnboardingScreen extends StatefulWidget {
@@ -41,6 +42,17 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   late DateTime _quitDate;
 
   bool get _isEdit => widget.initialProfile != null;
+  bool _unitsDefaulted = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // New profiles start with the units that are normal in the phone's region.
+    if (!_unitsDefaulted) {
+      _unitsDefaulted = true;
+      if (!_isEdit) _useImperial = Fmt.defaultsToImperial(Localizations.localeOf(context));
+    }
+  }
 
   @override
   void initState() {
@@ -189,13 +201,9 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 
   // ───────────────────────── Pickers / formatting ─────────────────────────
 
-  String _fmtDate(DateTime d) => "${d.month}/${d.day}/${d.year}";
+  String _fmtDate(DateTime d) => Fmt.date(context, d);
 
-  String _fmtDateTime(DateTime d) {
-    final int h12 = d.hour % 12 == 0 ? 12 : d.hour % 12;
-    final String ampm = d.hour >= 12 ? "PM" : "AM";
-    return "${_fmtDate(d)} at $h12:${d.minute.toString().padLeft(2, '0')} $ampm";
-  }
+  String _fmtDateTime(DateTime d) => Fmt.dateTime(context, d);
 
   String get _heightLabel {
     if (_useImperial) {
@@ -285,8 +293,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     return _pageShell(
       icon: Icons.air_rounded,
       title: _isEdit ? "Your profile" : "Let's personalize AirEngine",
-      why: "A few quick questions so your streak, milestones and lung-age estimate "
-          "fit you. You can change any of this later.",
+      why: "A few quick questions so your streak, savings and milestones fit you. "
+          "You can change any of this later.",
       children: [
         TextField(
           controller: _nameCtrl,
@@ -310,7 +318,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     return _pageShell(
       icon: Icons.cake_rounded,
       title: "When were you born?",
-      why: "Your age is used for the lung-age estimate. We store your birth date so your "
+      why: "Your age goes into the summary you can share with a clinician. It does not change "
+          "your Breath Score, which compares you to your own baseline. We store your birth date so your "
           "age stays correct over time.",
       children: [
         OutlinedButton.icon(
@@ -332,8 +341,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     return _pageShell(
       icon: Icons.straighten_rounded,
       title: "Sex and height",
-      why: "The estimation formulas differ by sex and use height. "
-          "\"Prefer not to say\" uses an average of both.",
+      why: "Sex and height appear in the clinician summary only. They do not change your Breath Score. "
+          "\"Prefer not to say\" is fine.",
       children: [
         SegmentedButton<BiologicalSex>(
           segments: const [
@@ -379,27 +388,33 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
       title: "Your quit date",
       why: "This starts your smoke-free streak and your health milestones.",
       children: [
-        RadioListTile<SmokingStatus>(
-          value: SmokingStatus.quit,
+        RadioGroup<SmokingStatus>(
           groupValue: _status,
-          title: const Text("I've already quit"),
-          subtitle: const Text("Count from my last cigarette"),
-          onChanged: (v) => setState(() {
-            _status = v!;
-            if (_quitDate.isAfter(DateTime.now())) _quitDate = DateTime.now();
-          }),
-        ),
-        RadioListTile<SmokingStatus>(
-          value: SmokingStatus.planningToQuit,
-          groupValue: _status,
-          title: const Text("I plan to quit"),
-          subtitle: const Text("Streak starts on my chosen date"),
-          onChanged: (v) => setState(() {
-            _status = v!;
-            if (!_quitDate.isAfter(DateTime.now())) {
-              _quitDate = DateTime.now().add(const Duration(days: 1));
-            }
-          }),
+          onChanged: (SmokingStatus? v) {
+            if (v == null) return;
+            setState(() {
+              _status = v;
+              if (v == SmokingStatus.quit) {
+                if (_quitDate.isAfter(DateTime.now())) _quitDate = DateTime.now();
+              } else if (!_quitDate.isAfter(DateTime.now())) {
+                _quitDate = DateTime.now().add(const Duration(days: 1));
+              }
+            });
+          },
+          child: const Column(
+            children: [
+              RadioListTile<SmokingStatus>(
+                value: SmokingStatus.quit,
+                title: Text("I've already quit"),
+                subtitle: Text("Count from my last cigarette"),
+              ),
+              RadioListTile<SmokingStatus>(
+                value: SmokingStatus.planningToQuit,
+                title: Text("I plan to quit"),
+                subtitle: Text("Streak starts on my chosen date"),
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 16),
         OutlinedButton.icon(
@@ -447,10 +462,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         TextField(
           controller: _priceCtrl,
           keyboardType: const TextInputType.numberWithOptions(decimal: true),
-          decoration: const InputDecoration(
+          decoration: InputDecoration(
             labelText: "Price per pack of 20 (optional)",
-            prefixText: "\$ ",
-            border: OutlineInputBorder(),
+            prefixText: "${Fmt.currencySymbol(context)} ",
+            border: const OutlineInputBorder(),
           ),
         ),
       ],

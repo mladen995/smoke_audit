@@ -2,24 +2,35 @@ name: smoke_audit
 description: "AirEngine - Acoustic Pulmonary Telemetry & Cessation Shield Platform."
 publish_to: 'none'
 
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
-  sdk: '>=3.2.0 <4.0.0'
+  sdk: '>=3.4.0 <4.0.0'
 
 dependencies:
   flutter:
     sdk: flutter
+  flutter_localizations:
+    sdk: flutter
 
-  # 🎧 Moving to a newer minor range completely resolves the internal platform interface mismatch
   record: ^6.1.2
-  
   path_provider: ^2.1.2
   shared_preferences: ^2.2.2
   fl_chart: ^0.66.0
   share_plus: ^10.0.0
   geolocator: ^11.0.0
   cupertino_icons: ^1.0.6
+
+  # New in this update
+  intl: any
+  path: ^1.9.0
+  pdf: ^3.11.1
+  file_picker: ^10.3.7
+  url_launcher: ^6.3.0
+  local_auth: ^2.3.0
+  flutter_local_notifications: ^19.0.0
+  flutter_timezone: ^5.1.1
+  timezone: any
 
 dev_dependencies:
   flutter_test:
@@ -28,3 +39,6 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+dependency_overrides:
+  image: '>=4.0.0 <4.11.0'
